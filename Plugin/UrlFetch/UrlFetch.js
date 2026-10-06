@@ -14,6 +14,8 @@ const { JSDOM } = require('jsdom');
 const { PDFParse } = require('pdf-parse');
 const https = require('https');
 const http = require('http');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
 const browserRuntimeManager = require('../../modules/browserRuntimeManager.js');
 
 // 图片扩展名常量
@@ -43,6 +45,32 @@ const URLFETCH_HEADLESS = String(process.env.URLFETCH_HEADLESS || 'true').toLowe
 const URLFETCH_BROWSER_BACKEND = String(process.env.URLFETCH_BROWSER_BACKEND || 'auto').toLowerCase();
 const URLFETCH_USE_MANAGED_CHROME = String(process.env.URLFETCH_USE_MANAGED_CHROME || 'false').toLowerCase() === 'true';
 const URLFETCH_MANAGED_CHROME_HIGH_RISK_ONLY = String(process.env.URLFETCH_MANAGED_CHROME_HIGH_RISK_ONLY || 'true').toLowerCase() !== 'false';
+// direct 模式专用代理：支持远程 HTTP 代理与 URL 内嵌账号密码（如 http://user:pass@host:port）。
+// 仅作用于 fetchWithDirectHttp 直连路径；留空则直连不走代理。
+const DIRECT_PROXY_URL = String(
+    process.env.FETCH_PROXY_URL ||
+    process.env.URLFETCH_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.HTTP_PROXY ||
+    ''
+).trim();
+const directAgentCache = new Map();
+// 代理旁路名单：命中的域名只走直连（国内站经境外出口易 403 / socket hang up）。
+const DIRECT_PROXY_BYPASS = String(process.env.FETCH_PROXY_BYPASS || '')
+    .split(',')
+    .map(item => item.trim().toLowerCase())
+    .filter(Boolean);
+
+// 判断 URL 是否命中旁路名单（按域名后缀匹配，覆盖子域名）。
+function isProxyBypassed(targetUrl) {
+    if (!DIRECT_PROXY_BYPASS.length) return false;
+    try {
+        const host = new URL(targetUrl).hostname.toLowerCase();
+        return DIRECT_PROXY_BYPASS.some(domain => host === domain || host.endsWith(`.${domain}`));
+    } catch {
+        return false;
+    }
+}
 const URLFETCH_MANAGED_CHROME_AUTO_CLOSE = String(process.env.URLFETCH_MANAGED_CHROME_AUTO_CLOSE || process.env.VCP_BROWSER_AUTO_CLOSE_AFTER_URLFETCH || 'true').toLowerCase() === 'true';
 const URLFETCH_MANAGED_CHROME_CLOSE_TAB = String(process.env.URLFETCH_MANAGED_CHROME_CLOSE_TAB || 'true').toLowerCase() !== 'false';
 const URLFETCH_HIGH_RISK_DOMAINS = String(
@@ -424,7 +452,28 @@ function isHighRiskDomain(url) {
 }
 
 function shouldUseBrowserFirst(url, mode) {
+    // backend=direct 表示彻底禁用浏览器：不因高风险域名或 BROWSER_FIRST 而启动 Puppeteer。
+    if (URLFETCH_BROWSER_BACKEND === 'direct') return false;
     return mode === 'text' && (URLFETCH_BROWSER_FIRST || isHighRiskDomain(url));
+}
+
+// 构建 direct 路径的代理 Agent（按协议缓存，失败返回 undefined 表示直连）。
+function getDirectProxyAgent(targetUrl, enableProxy = false) {
+    if (!enableProxy || !DIRECT_PROXY_URL) return undefined;
+    if (isProxyBypassed(targetUrl)) return undefined;
+    const isHttps = /^https:/i.test(targetUrl);
+    const key = isHttps ? 'https' : 'http';
+    if (!directAgentCache.has(key)) {
+        try {
+            directAgentCache.set(key, isHttps
+                ? new HttpsProxyAgent(DIRECT_PROXY_URL)
+                : new HttpProxyAgent(DIRECT_PROXY_URL));
+        } catch (error) {
+            console.error(`构建代理 Agent 失败，回退直连: ${error.message}`);
+            return undefined;
+        }
+    }
+    return directAgentCache.get(key);
 }
 
 function getPersistentProfilePath(url, proxyPort = null) {
@@ -660,7 +709,7 @@ async function fetchWithJinaReader(url) {
     throw new Error(errors.join('；'));
 }
 
-function requestDirectHttp(targetUrl, redirectCount = 0) {
+function requestDirectHttp(targetUrl, redirectCount = 0, enableProxy = false) {
     return new Promise((resolve, reject) => {
         if (redirectCount > 5) {
             reject(new Error('直接读取失败: 重定向次数过多'));
@@ -676,8 +725,10 @@ function requestDirectHttp(targetUrl, redirectCount = 0) {
         }
 
         const transport = urlObj.protocol === 'https:' ? https : http;
+        const proxyAgent = getDirectProxyAgent(targetUrl, enableProxy);
         const req = transport.get(urlObj, {
             timeout: DIRECT_FETCH_TIMEOUT_MS,
+            ...(proxyAgent ? { agent: proxyAgent } : {}),
             headers: {
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5',
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -690,7 +741,7 @@ function requestDirectHttp(targetUrl, redirectCount = 0) {
             if ([301, 302, 303, 307, 308].includes(statusCode) && location) {
                 res.resume();
                 const nextUrl = new URL(location, urlObj).toString();
-                requestDirectHttp(nextUrl, redirectCount + 1).then(resolve, reject);
+                requestDirectHttp(nextUrl, redirectCount + 1, enableProxy).then(resolve, reject);
                 return;
             }
 
@@ -775,7 +826,21 @@ function requestDirectHttp(targetUrl, redirectCount = 0) {
 }
 
 async function fetchWithDirectHttp(url) {
-    const { body, buffer, isPdf, contentType, finalUrl } = await requestDirectHttp(url);
+    // 代理分流：配置了代理且域名不在旁路名单 -> 先走代理，失败自动回退直连；
+    // 命中旁路名单（国内站）-> 只走直连，避免境外出口导致 403 / socket hang up。
+    const wantProxy = !!DIRECT_PROXY_URL && !isProxyBypassed(url);
+    let payload;
+    if (wantProxy) {
+        try {
+            payload = await requestDirectHttp(url, 0, true);
+        } catch (proxyError) {
+            console.error(`代理抓取失败，回退直连: ${proxyError.message}`);
+            payload = await requestDirectHttp(url, 0, false);
+        }
+    } else {
+        payload = await requestDirectHttp(url, 0, false);
+    }
+    const { body, buffer, isPdf, contentType, finalUrl } = payload;
 
     if (isPdf) {
         return await extractPdfText(buffer, finalUrl);
@@ -1318,6 +1383,11 @@ async function main() {
                                 try {
                                     fetchedData = await fetchWithDirectHttp(url);
                                 } catch (directError) {
+                                    // backend=direct：彻底禁用浏览器，直连失败直接抛出原始错误，
+                                    // 避免回退 Puppeteer 后报出误导性的 "Could not find Chrome"。
+                                    if (URLFETCH_BROWSER_BACKEND === 'direct') {
+                                        throw directError;
+                                    }
                                     console.error(`直接读取快速路径失败，回退浏览器: ${directError.message}`);
                                     if (shouldUseManagedChrome(url, 'text')) {
                                         try {
@@ -1335,6 +1405,11 @@ async function main() {
                             try {
                                 fetchedData = await fetchWithDirectHttp(url);
                             } catch (directError) {
+                                // backend=direct：彻底禁用浏览器，直连失败直接抛出原始错误，
+                                // 避免回退 Puppeteer 后报出误导性的 "Could not find Chrome"。
+                                if (URLFETCH_BROWSER_BACKEND === 'direct') {
+                                    throw directError;
+                                }
                                 console.error(`直接读取快速路径失败，回退浏览器: ${directError.message}`);
                                 if (shouldUseManagedChrome(url, 'text')) {
                                     try {
@@ -1383,6 +1458,11 @@ async function main() {
                             try {
                                 fetchedData = await fetchWithDirectHttp(url);
                             } catch (directError) {
+                                // backend=direct：彻底禁用浏览器，直连失败直接抛出原始错误，
+                                // 避免回退 Puppeteer 后报出误导性的 "Could not find Chrome"。
+                                if (URLFETCH_BROWSER_BACKEND === 'direct') {
+                                    throw directError;
+                                }
                                 console.error(`直接读取快速路径失败，回退浏览器: ${directError.message}`);
                                 if (shouldUseManagedChrome(url, mode)) {
                                     try {
