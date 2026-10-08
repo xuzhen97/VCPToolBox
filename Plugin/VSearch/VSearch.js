@@ -47,8 +47,12 @@ const log = (message) => {
 };
 
 const sendResponse = (data) => {
-    console.log(JSON.stringify(data));
-    process.exit(0);
+    // 管道 stdout 是异步写：必须等数据刷出后再退出。
+    // 否则输出超过 64KB（Linux 管道缓冲区）时会被 process.exit 截断，
+    // 导致宿主 JSON.parse 失败并报 "did not provide a valid initial JSON response"。
+    process.stdout.write(`${JSON.stringify(data)}\n`, () => process.exit(0));
+    // 兜底：读者阻塞导致回调迟迟不触发时，5 秒后强制退出，避免进程悬挂。
+    setTimeout(() => process.exit(0), 5000);
 };
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
