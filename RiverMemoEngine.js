@@ -249,9 +249,10 @@ class RiverMemoEngine {
                         error.code = 'NATIVE_RIVER_QUERY_EMPTY_DIARY_SCOPE';
                         throw error;
                     }
-                    const queryVector = query?.vector instanceof Float32Array
-                        ? query.vector
-                        : new Float32Array(query?.vector || []);
+                    const annVector = options.nativeAnnVector || query?.vector;
+                    const queryVector = annVector instanceof Float32Array
+                        ? annVector
+                        : new Float32Array(annVector || []);
                     const nativePerIndexK = Math.max(
                         1,
                         Math.floor(Number(options.nativePerIndexK) || 300)
@@ -432,6 +433,9 @@ class RiverMemoEngine {
                 score: clamp01(item.score),
                 originalScore: Number(item.originalScore) || 0,
                 baseScore: clamp01(item.baseScore),
+                pathBonus: clamp01(item.pathBonus),
+                graphBonus: clamp01(item.graphBonus),
+                scoreClipping: Math.max(0, Number(item.scoreClipping) || 0),
                 topologyBonus: clamp01(item.topologyBonus),
                 anchorBonus: clamp01(item.anchorBonus),
                 matchedTags,
@@ -468,7 +472,7 @@ class RiverMemoEngine {
         return Object.freeze({
             schema: RESULT_SCHEMA,
             version: VERSION,
-            algorithmVersion: ALGORITHM_VERSION,
+            algorithmVersion: nativeResult.algorithmVersion || ALGORITHM_VERSION,
             artifactSig: artifact.artifactSig,
             artifactGeneration: artifact.generation,
             queryId: queryState.queryId,

@@ -20,7 +20,7 @@ use crate::storage::{ensure_tag_vectors_loaded, TagVectorPool};
 use crate::storage::load_vectors_by_ids;
 
 const PIPELINE_SCHEMA: &str = "vexus-unified-memo-pipeline-v1";
-const PIPELINE_ALGORITHM: &str = "tagmemo.epa-pyramid-spike-fusion-v9.4-calibrated-rust";
+const PIPELINE_ALGORITHM: &str = "memo.safe-stoploss-v1.1";
 
 fn positive(value: f64) -> f64 {
     if value.is_finite() {
@@ -82,7 +82,7 @@ struct PipelineInput {
     #[serde(default)]
     query_id: Option<String>,
     #[serde(default, rename = "queryText")]
-    _query_text: String,
+    query_text: String,
     #[serde(default)]
     query_vector: Vec<f32>,
     #[serde(default)]
@@ -120,6 +120,9 @@ struct PipelineConfig {
     pyramid_top_k: usize,
     min_energy_ratio: f64,
     layer_decay: f64,
+    min_layer_explained_energy: f64,
+    seed_contribution_ratio: f64,
+    seed_contribution_floor: f64,
     activation_multiplier: Vec<f64>,
     dynamic_boost_range: Vec<f64>,
     core_boost_range: Vec<f64>,
@@ -153,6 +156,9 @@ impl Default for PipelineConfig {
             pyramid_top_k: 10,
             min_energy_ratio: 0.1,
             layer_decay: 0.7,
+            min_layer_explained_energy: 0.03,
+            seed_contribution_ratio: 0.1,
+            seed_contribution_floor: 0.05,
             activation_multiplier: vec![0.5, 1.5],
             dynamic_boost_range: vec![0.3, 2.0],
             core_boost_range: vec![1.2, 1.4],
@@ -257,6 +263,46 @@ fn calibrated_gate(ratio: f64, baseline: f64, background: f64, mode: &str) -> f6
     }
 }
 
+/// Query-independent part of the EPA cache row: decoded basis and mean, and the
+/// values derived from them alone.
+struct EpaBasis {
+    raw: String,
+    dimension: usize,
+    k_sem: usize,
+    labels: Vec<String>,
+    mean: Vec<f32>,
+    bases: Vec<Vec<f32>>,
+    semantic_count: usize,
+    baseline_coverage: f64,
+    background_ratio: f64,
+}
+
+/// The most recently decoded EPA cache row. It is reused only when the stored
+/// JSON text and the dimension are identical, so any write to the row (in any
+/// database) decodes again; the per-query arithmetic is unchanged.
+static EPA_BASIS: std::sync::Mutex<Option<Arc<EpaBasis>>> = std::sync::Mutex::new(None);
+
+fn decode_epa_basis(raw: String, dimension: usize) -> Option<EpaBasis> {
+    let cache: EpaCache = serde_json::from_str(&raw).ok()?;
+    let mean = decode_f32_base64(&cache.mean, dimension)?;
+    let bases: Vec<Vec<f32>> = cache
+        .basis
+        .iter()
+        .filter_map(|encoded| decode_f32_base64(encoded, dimension))
+        .collect();
+    let semantic_count = cache.k_sem.max(1).min(bases.len());
+    let baseline_coverage=cache.coverage.get(semantic_count.saturating_sub(1)).copied()
+        .filter(|v|v.is_finite() && *v>0.0 && *v<=1.0)
+        .unwrap_or(semantic_count as f64/dimension.max(1) as f64).max(1e-4);
+    let mean_captured=bases.iter().take(semantic_count).map(|b|dot(&mean,b).powi(2)).sum::<f64>();
+    let background_ratio=clamp01((semantic_count as f64/dimension.max(1) as f64+mean_captured)
+        /(1.0+dot(&mean,&mean)));
+    Some(EpaBasis {
+        raw, dimension, k_sem: cache.k_sem, labels: cache.labels, mean, bases,
+        semantic_count, baseline_coverage, background_ratio,
+    })
+}
+
 fn analyze_epa_with_mode(connection: &Connection, query: &[f32], dimension: usize, mode: &str) -> EpaOutput {
     let empty = || EpaOutput {
         logic_depth: 0.0,
@@ -280,19 +326,24 @@ fn analyze_epa_with_mode(connection: &Connection, query: &[f32], dimension: usiz
         Ok(value) => value,
         Err(_) => return empty(),
     };
-    let cache: EpaCache = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => return empty(),
+    let cached = EPA_BASIS.lock().ok().and_then(|slot| {
+        slot.as_ref().filter(|basis| basis.dimension == dimension && basis.raw == raw).cloned()
+    });
+    let basis = match cached {
+        Some(basis) => basis,
+        None => match decode_epa_basis(raw, dimension) {
+            Some(basis) => {
+                let basis = Arc::new(basis);
+                if let Ok(mut slot) = EPA_BASIS.lock() {
+                    *slot = Some(basis.clone());
+                }
+                basis
+            }
+            None => return empty(),
+        },
     };
-    let mean = match decode_f32_base64(&cache.mean, dimension) {
-        Some(value) => value,
-        None => return empty(),
-    };
-    let bases: Vec<Vec<f32>> = cache
-        .basis
-        .iter()
-        .filter_map(|encoded| decode_f32_base64(encoded, dimension))
-        .collect();
+    let mean = &basis.mean;
+    let bases = &basis.bases;
     let centered: Vec<f32> = query
         .iter()
         .zip(mean.iter())
@@ -304,17 +355,13 @@ fn analyze_epa_with_mode(connection: &Connection, query: &[f32], dimension: usiz
     let out_of_domain = if centered_energy > 1e-12 {
         ((centered_energy - captured).max(0.0) / centered_energy).sqrt().clamp(0.0, 1.0)
     } else { 0.0 };
-    let semantic_count = cache.k_sem.max(1).min(bases.len());
+    let semantic_count = basis.semantic_count;
     let total_energy = projections.iter().take(semantic_count).map(|value| value * value).sum::<f64>();
     let semantic_explained_ratio = if centered_energy > 1e-12 {
         clamp01(total_energy / centered_energy)
     } else { 0.0 };
-    let baseline_coverage=cache.coverage.get(semantic_count.saturating_sub(1)).copied()
-        .filter(|v|v.is_finite() && *v>0.0 && *v<=1.0)
-        .unwrap_or(semantic_count as f64/dimension.max(1) as f64).max(1e-4);
-    let mean_captured=bases.iter().take(semantic_count).map(|b|dot(&mean,b).powi(2)).sum::<f64>();
-    let background_ratio=clamp01((semantic_count as f64/dimension.max(1) as f64+mean_captured)
-        /(1.0+dot(&mean,&mean)));
+    let baseline_coverage = basis.baseline_coverage;
+    let background_ratio = basis.background_ratio;
     let in_domain_gate=if semantic_count==0 || centered_energy<=1e-12 {0.0}
         else {calibrated_gate(semantic_explained_ratio,baseline_coverage,background_ratio,mode)};
     let probabilities: Vec<f64> = projections
@@ -328,8 +375,8 @@ fn analyze_epa_with_mode(connection: &Connection, query: &[f32], dimension: usiz
         .sum::<f64>();
     let normalized_entropy = if total_energy <= 1e-12 {
         1.0
-    } else if cache.k_sem > 1 {
-        clamp01(raw_entropy / (cache.k_sem as f64).log2())
+    } else if basis.k_sem > 1 {
+        clamp01(raw_entropy / (basis.k_sem as f64).log2())
     } else {
         0.0
     };
@@ -339,7 +386,7 @@ fn analyze_epa_with_mode(connection: &Connection, query: &[f32], dimension: usiz
         .filter(|(_, energy)| **energy > 0.05)
         .map(|(index, energy)| EpaAxis {
             index,
-            label: cache
+            label: basis
                 .labels
                 .get(index)
                 .cloned()
@@ -667,12 +714,17 @@ fn analyze_pyramid_with_pool(
         let (projection, next_residual, coefficients) =
             orthogonal_projection(&residual, &tags, dimension);
         for (tag, coefficient) in tags.iter_mut().zip(coefficients.iter()) {
-            tag.contribution = *coefficient;
+            tag.contribution = *coefficient / current_energy.sqrt().max(1e-12);
         }
         let handshake = analyze_handshakes(&residual, &mut tags, dimension);
         let residual_magnitude = magnitude(&next_residual);
         let residual_energy = residual_magnitude * residual_magnitude;
         let energy_explained = positive(current_energy - residual_energy) / original_energy;
+        // A large remaining residual is not evidence that another layer is useful.
+        // Reject before publishing work/residuals, including dynamic-wormhole inputs.
+        if energy_explained < config.min_layer_explained_energy.clamp(0.0, 1.0) {
+            break;
+        }
         total_explained += energy_explained;
         levels_output.push(PyramidLevelOutput {
             level,
@@ -735,6 +787,39 @@ struct GatedTag {
     name: String,
     weight: f64,
     is_core: bool,
+    lexical: bool,
+}
+
+// ASCII words have token boundaries; CJK uses adjacent bigrams (singletons
+// only for one-character runs). Punctuation never joins unrelated ASCII words.
+fn lexical_tokens(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut ascii = String::new();
+    let mut cjk = Vec::new();
+    let flush = |ascii: &mut String, cjk: &mut Vec<char>, tokens: &mut HashSet<String>| {
+        if !ascii.is_empty() { tokens.insert(std::mem::take(ascii)); }
+        if cjk.len() == 1 { tokens.insert(cjk[0].to_string()); }
+        for pair in cjk.windows(2) { tokens.insert(pair.iter().collect()); }
+        cjk.clear();
+    };
+    for ch in text.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if !cjk.is_empty() { flush(&mut ascii, &mut cjk, &mut tokens); }
+            ascii.push(ch);
+        } else if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+            if !ascii.is_empty() { flush(&mut ascii, &mut cjk, &mut tokens); }
+            cjk.push(ch);
+        } else { flush(&mut ascii, &mut cjk, &mut tokens); }
+    }
+    flush(&mut ascii, &mut cjk, &mut tokens);
+    tokens
+}
+
+fn lexical_grounding(query: &str, name: &str) -> f64 {
+    let query = lexical_tokens(query);
+    let tag = lexical_tokens(name);
+    if tag.is_empty() { return 0.0; }
+    tag.intersection(&query).count() as f64 / tag.len() as f64
 }
 
 fn range_value(values: &[f64], index: usize, fallback: f64) -> f64 {
@@ -767,6 +852,7 @@ fn gate_tags(
     pyramid: &PyramidOutput,
     core_tags: &[String],
     config: &PipelineConfig,
+    query_text: &str,
 ) -> (Vec<GatedTag>, f64, f64) {
     let activation_min = range_value(&config.activation_multiplier, 0, 0.5);
     let activation_max = range_value(&config.activation_multiplier, 1, 1.5);
@@ -799,11 +885,32 @@ fn gate_tags(
     let mut seen = HashSet::new();
     let mut gated = Vec::new();
     for (level, tags) in levels.iter().enumerate() {
+        let maximum = tags.iter().map(|tag| positive(tag.contribution)).fold(0.0, f64::max);
+        let threshold = (maximum * config.seed_contribution_ratio.clamp(0.0, 1.0))
+            .max(config.seed_contribution_floor.max(0.0));
         for tag in tags {
-            if tag.id <= 0 || !seen.insert(tag.id) {
+            let is_core = core_names.contains(&tag.name.to_lowercase());
+            if tag.id <= 0 || seen.contains(&tag.id) {
                 continue;
             }
-            let is_core = core_names.contains(&tag.name.to_lowercase());
+            let grounding = lexical_grounding(query_text, &tag.name);
+            let lexical = grounding >= 0.5;
+            // Only already independently supported peers can lend amplitude.
+            // A low-contribution alias cannot recursively sponsor other aliases.
+            let sponsor = tags.iter().filter(|peer| peer.id != tag.id
+                && peer.contribution >= threshold && peer.similarity > 0.0
+                && cosine(&peer.vector, &tag.vector) >= 0.80)
+                .map(|peer| peer.contribution).fold(0.0, f64::max);
+            let alias = tag.similarity >= 0.20 && sponsor > 0.0;
+            if !is_core && !lexical && !alias
+                && (tag.contribution < threshold || tag.similarity <= 0.0) {
+                continue;
+            }
+            let effective_contribution = if lexical || alias {
+                tag.contribution.max(0.6 * sponsor)
+                    .max(if lexical { 0.6 * maximum } else { 0.0 })
+            } else { tag.contribution };
+            seen.insert(tag.id);
             // Cosine zero is a measured orthogonal relationship, not a
             // missing-score sentinel. Every pyramid candidate is measured
             // against its SQL original before entering this gate.
@@ -814,7 +921,7 @@ fn gate_tags(
                 1.0
             };
             let mut language_gain = 1.0;
-            if config.lang_confidence_enabled && technical_name(&tag.name, true) && !technical_world
+            if !lexical && config.lang_confidence_enabled && technical_name(&tag.name, true) && !technical_world
             {
                 let penalty = if world == "Unknown" {
                     config.lang_penalty_unknown
@@ -828,16 +935,31 @@ fn gate_tags(
                     penalty
                 };
             }
-            let layer_gain = config.layer_decay.clamp(0.0, 1.0).powi(level as i32);
-            let weight = positive(tag.contribution) * layer_gain * language_gain * core_gain;
+            let decay = config.layer_decay.clamp(0.0, 1.0).powi(level as i32);
+            // Restore, never amplify, strong residual foci in accepted layers.
+            let independent_support = clamp01(effective_contribution / maximum.max(1e-12));
+            let layer_gain = if lexical { 1.0 } else {
+                decay + (1.0 - decay) * independent_support
+            };
+            let raw_weight = positive(effective_contribution) * layer_gain * language_gain * core_gain
+                * if lexical && !is_core { 1.6 } else { 1.0 };
+            let weight = if is_core { raw_weight } else { raw_weight.min(1.0) };
             if weight > 0.0 {
                 gated.push(GatedTag {
                     id: tag.id,
                     name: tag.name.clone(),
                     weight,
                     is_core,
+                    lexical,
                 });
             }
+        }
+    }
+    let explicit_max = gated.iter().filter(|t| t.is_core || t.lexical)
+        .map(|t| t.weight).fold(0.0, f64::max);
+    if explicit_max > 0.0 {
+        for tag in &mut gated {
+            if !tag.is_core && !tag.lexical { tag.weight = tag.weight.min(0.35 * explicit_max); }
         }
     }
     (gated, effective_boost.clamp(0.0, 1.0), dynamic_core_boost)
@@ -903,6 +1025,7 @@ fn fuse_observation_with_pool(
                 name: seed.name.clone(),
                 weight: seed.weight.max(node.energy),
                 is_core: seed.is_core,
+                lexical: seed.lexical,
             });
         } else {
             emergent.push(GatedTag {
@@ -910,6 +1033,7 @@ fn fuse_observation_with_pool(
                 name: String::new(),
                 weight: node.energy,
                 is_core: false,
+                lexical: false,
             });
         }
     }
@@ -968,6 +1092,7 @@ fn fuse_observation_with_pool(
                 name,
                 weight: max_base_weight * dynamic_core_boost,
                 is_core: true,
+                lexical: false,
             });
             supplemented_core_count += 1;
         }
@@ -1151,8 +1276,55 @@ fn apply_transport(
     }
 }
 
-fn l1_distance(left: &[f64], right: &[f64]) -> f64 {
-    left.iter().zip(right).map(|(a, b)| (a - b).abs()).sum()
+/// `apply_transport` for both fields in one pass over the CSR. Every output
+/// position receives the same additions in the same order as two separate
+/// passes, and each field keeps its own zero-mass skip.
+fn apply_transport_pair(
+    artifact: &crate::rivermemo_topology_v3::NativeArtifact,
+    local: &[f64],
+    transfer: &[f64],
+    local_output: &mut [f64],
+    transfer_output: &mut [f64],
+) {
+    local_output.fill(0.0);
+    transfer_output.fill(0.0);
+    for source in 0..artifact.node_ids.len() {
+        let local_mass = local[source];
+        let transfer_mass = transfer[source];
+        let local_active = local_mass != 0.0;
+        let transfer_active = transfer_mass != 0.0;
+        if !local_active && !transfer_active {
+            continue;
+        }
+        for cursor in artifact.row_offsets[source]..artifact.row_offsets[source + 1] {
+            let weight = positive(artifact.weights[cursor]);
+            let target = artifact.targets[cursor];
+            if local_active {
+                local_output[target] += local_mass * weight;
+            }
+            if transfer_active {
+                transfer_output[target] += transfer_mass * weight;
+            }
+        }
+    }
+}
+
+/// `next = (1 - alpha) * source + alpha * propagated` and the L1 change from
+/// `current`, in one pass with the same arithmetic and index order as a
+/// separate update followed by an L1 sum of non-negative terms.
+fn relax_field(
+    source: &[f64],
+    propagated: &[f64],
+    alpha: f64,
+    current: &[f64],
+    next: &mut [f64],
+) -> f64 {
+    let mut residual = 0.0;
+    for index in 0..source.len() {
+        next[index] = (1.0 - alpha) * source[index] + alpha * propagated[index];
+        residual += (next[index] - current[index]).abs();
+    }
+    residual
 }
 
 fn field_mass(field: &[f64]) -> f64 {
@@ -1450,8 +1622,15 @@ fn project_basin_fields(
             selected_mass += mass;
             let Some(vector) = pool.get(id) else { continue };
             projected_mass += mass;
+            // Transport already penalizes hubs. Apply only a mild residual
+            // projection discount, preserving the observed query core unchanged.
+            let hub_ratio = if artifact.max_inbound > 0.0 {
+                positive(artifact.inbound.get(id).copied().unwrap_or(0.0)) / artifact.max_inbound
+            } else { 0.0 };
+            let projection_gain = if river_ids.contains(id) { 1.0 }
+                else { 1.0 / (1.0 + hub_ratio.sqrt()) };
             for (out, value) in outputs[field].iter_mut().zip(vector.iter()) {
-                *out += *value as f64 * mass;
+                *out += *value as f64 * mass * projection_gain;
             }
         }
         if projected_mass > 0.0 {
@@ -1540,23 +1719,24 @@ fn solve_dual_fields_with_pool(
 
     for iteration in 1..=config.field_max_iterations.max(1) {
         iterations = iteration;
-        if !local_converged {
+        // The fields are independent; while both move, one CSR pass serves both.
+        if !local_converged && !transfer_converged {
+            apply_transport_pair(artifact, &local, &transfer,
+                &mut propagated_local, &mut propagated_transfer);
+        } else if !local_converged {
             apply_transport(artifact, &local, &mut propagated_local);
-            for index in 0..source.len() {
-                next_local[index] =
-                    (1.0 - local_alpha) * source[index] + local_alpha * propagated_local[index];
-            }
-            local_residual = l1_distance(&next_local, &local);
+        } else if !transfer_converged {
+            apply_transport(artifact, &transfer, &mut propagated_transfer);
+        }
+        if !local_converged {
+            local_residual = relax_field(&source, &propagated_local, local_alpha,
+                &local, &mut next_local);
             local_converged = local_residual <= config.local_tolerance.max(1e-15);
             std::mem::swap(&mut local, &mut next_local);
         }
         if !transfer_converged {
-            apply_transport(artifact, &transfer, &mut propagated_transfer);
-            for index in 0..source.len() {
-                next_transfer[index] = (1.0 - transfer_alpha) * source[index]
-                    + transfer_alpha * propagated_transfer[index];
-            }
-            transfer_residual = l1_distance(&next_transfer, &transfer);
+            transfer_residual = relax_field(&source, &propagated_transfer, transfer_alpha,
+                &transfer, &mut next_transfer);
             transfer_converged = transfer_residual <= config.transfer_tolerance.max(1e-15);
             std::mem::swap(&mut transfer, &mut next_transfer);
         }
@@ -1660,12 +1840,13 @@ struct PipelineMetadataOutput {
     matched_tags: Vec<String>,
     core_tags_matched: Vec<String>,
     effective_tag_boost: f64,
+    propagation_parameters: SenseConfig,
     diagnostics: PipelineDiagnostics,
 }
 
 pub struct MemoPipelineComputeOutput {
-    metadata_json: String,
-    enhanced_vector: Vec<f32>,
+    pub(crate) metadata_json: String,
+    pub(crate) enhanced_vector: Vec<f32>,
 }
 
 /// 统一 Memo 查询的轻量 N-API 返回值。
@@ -1738,7 +1919,7 @@ fn run_pipeline_with_connection(
 
     let gating_started = Instant::now();
     let (gated_tags, effective_tag_boost, dynamic_core_boost) =
-        gate_tags(&level_tags, &epa, &pyramid, &input.core_tags, &input.config);
+        gate_tags(&level_tags, &epa, &pyramid, &input.core_tags, &input.config, &input.query_text);
     // 空 Pyramid 门控不再中止：Spike 生成合法空观测，随后字符串 Core/幽灵
     // 仍按 JS SOTA 在传播后注入；若最终仍为空，融合层返回原查询向量。
     let seeds: Vec<SenseSeed> = gated_tags
@@ -1748,6 +1929,8 @@ fn run_pipeline_with_connection(
             energy: tag.weight,
             source_type: if tag.is_core {
                 "core".to_string()
+            } else if tag.lexical {
+                "lexical_seed".to_string()
             } else {
                 "seed".to_string()
             },
@@ -1860,6 +2043,7 @@ fn run_pipeline_with_connection(
         matched_tags,
         core_tags_matched,
         effective_tag_boost,
+        propagation_parameters: input.config.spike_routing.clone(),
         diagnostics: PipelineDiagnostics {
             backend: "rust-unified-memo-pipeline".to_string(),
             runtime_ownership: "vexus-index-instance".to_string(),
@@ -1975,6 +2159,23 @@ impl Task for MemoPipelineTask {
     }
 }
 
+pub(crate) fn compute_owned(
+    index: Arc<crate::index_handle::IndexHandle>,
+    content_revision: Arc<std::sync::atomic::AtomicU64>,
+    runtime: Arc<MemoRuntime>,
+    db_path: String,
+    artifact_sig: String,
+    dimensions: usize,
+    input_json: String,
+    query_vector: Vec<f32>,
+    ghost_vectors: Vec<f32>,
+) -> Result<MemoPipelineComputeOutput> {
+    MemoPipelineTask {
+        index, content_revision, runtime, db_path, artifact_sig, dimensions,
+        input_json, query_vector, ghost_vectors,
+    }.compute()
+}
+
 pub(crate) fn run_with_runtime(
     lifecycle: &Arc<crate::task_lifecycle::TaskLifecycle>,
     index: Arc<crate::index_handle::IndexHandle>,
@@ -2071,7 +2272,7 @@ mod audit_gate_tests {
             }).collect::<Vec<_>>()];
         let names = levels[0].iter().map(|tag| tag.name.clone()).collect::<Vec<_>>();
         let (gated, _, core_boost) = gate_tags(
-            &levels, &epa, &pyramid, &names, &PipelineConfig::default(),
+            &levels, &epa, &pyramid, &names, &PipelineConfig::default(), "",
         );
         assert_eq!(gated.len(), 3);
         for (tag, cosine) in gated.iter().zip([-1.0, 0.0, 1.0]) {
@@ -2456,5 +2657,99 @@ mod projection_budget_tests {
             assert!(serde_json::from_value::<PipelineConfig>(
                 serde_json::json!({"maxFieldProjectionNodes": value})).is_err());
         }
+    }
+}
+
+
+#[cfg(test)]
+mod stoploss_gate_tests {
+    use super::*;
+
+    #[test]
+    fn contribution_tails_are_removed_and_residual_focus_keeps_weight() {
+        let epa = EpaOutput {
+            logic_depth: 0.5, entropy: 0.5, resonance: 0.0, dominant_axes: vec![],
+            bridges: vec![], basis_count: 0, cache_available: false, out_of_domain: 1.0,
+            semantic_explained_ratio: 0.0, in_domain_gate: 0.0,
+            baseline_coverage: 0.0, background_ratio: 0.0,
+        };
+        let make = |id, contribution, similarity| PyramidTagWork {
+            id, name: format!("标签{id}"), vector: Arc::from(
+                if id == 2 || id == 4 { vec![0.0_f32, 1.0] } else { vec![1.0_f32, 0.0] }),
+            similarity, contribution, handshake_magnitude: 0.0,
+        };
+        let levels = vec![vec![make(1, 0.66, 0.66), make(2, 0.02, 0.6)],
+            vec![make(3, 0.2, 0.32), make(4, 0.01, 0.1), make(5, 0.1, -0.1)]];
+        let pyramid = PyramidOutput { levels: vec![], total_explained_energy: 0.68,
+            features: PyramidFeatures::default() };
+        let (gated, _, _) = gate_tags(&levels, &epa, &pyramid, &[], &PipelineConfig::default(), "");
+        assert_eq!(gated.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!((gated[1].weight - 0.2).abs() < 1e-12);
+    }
+}
+
+
+#[cfg(test)]
+mod lexical_patch_tests {
+    use super::*;
+
+    fn epa() -> EpaOutput {
+        EpaOutput { logic_depth: 0.5, entropy: 0.5, resonance: 0.0,
+            dominant_axes: vec![], bridges: vec![], basis_count: 0,
+            cache_available: false, out_of_domain: 1.0,
+            semantic_explained_ratio: 0.0, in_domain_gate: 0.0,
+            baseline_coverage: 0.0, background_ratio: 0.0 }
+    }
+
+    #[test]
+    fn lexical_grounding_respects_ascii_boundaries_and_mixed_names() {
+        let query = "小冰，还记得那个 Lunarium 星之旅吗？";
+        for name in ["Lunarium星之旅", "Lunarium", "星之旅"] {
+            assert_eq!(lexical_grounding(query, name), 1.0);
+        }
+        assert_eq!(lexical_grounding(query, "AI自编自演Galgame"), 0.0);
+        assert_eq!(lexical_grounding("chair", "AI"), 0.0);
+        assert_eq!(lexical_grounding("", "Lunarium"), 0.0);
+        assert_eq!(lexical_grounding("测试", ""), 0.0);
+    }
+
+    #[test]
+    fn grounded_residual_and_short_alias_survive_and_ignite_without_lowering_threshold() {
+        let make = |id, name: &str, contribution, similarity, vector: Vec<f32>| PyramidTagWork {
+            id, name: name.into(), contribution, similarity,
+            vector: Arc::from(vector), handshake_magnitude: 0.0,
+        };
+        // Realistic layer-normalized coefficients; short alias loses its
+        // independent component under Gram-Schmidt but retains identity.
+        let levels = vec![
+            vec![make(1, "AI自编自演Galgame", 0.6604, 0.66, vec![1.0, 0.0])],
+            vec![make(2, "Lunarium星之旅", 0.2109 / 0.6648, 0.32, vec![0.0, 1.0]),
+                 make(3, "Lunarium", 0.0288 / 0.6648, 0.23, vec![0.0, 1.0])],
+        ];
+        let pyramid = PyramidOutput { levels: vec![], total_explained_energy: 0.68,
+            features: PyramidFeatures::default() };
+        let (gated, _, _) = gate_tags(&levels, &epa(), &pyramid, &[],
+            &PipelineConfig::default(), "Lunarium 星之旅有问题");
+        let focus = gated.iter().find(|t| t.id == 2).unwrap();
+        let alias = gated.iter().find(|t| t.id == 3).unwrap();
+        let implicit = gated.iter().find(|t| t.id == 1).unwrap();
+        assert!(focus.lexical && alias.lexical);
+        assert!(focus.weight > 0.5);
+        assert!(alias.weight > 0.3); // ASCII language penalty must not suppress literal names.
+        assert!(implicit.weight <= focus.weight * 0.35);
+        let graph = crate::rivermemo_topology_v3::NativeArtifact {
+            node_ids: vec![1, 2, 3, 4],
+            node_index: [(1,0), (2,1), (3,2), (4,3)].into_iter().collect(),
+            row_offsets: vec![0,0,1,1,1], targets: vec![3], weights: vec![0.1],
+            ..crate::rivermemo_topology_v3::NativeArtifact::default()
+        }.prepared();
+        let output = sense_typed(&graph, "lexical-test", SenseInput {
+            query_id: None,
+            seeds: gated.iter().map(|t| SenseSeed { id: t.id, energy: t.weight,
+                source_type: if t.lexical { "lexical_seed" } else { "seed" }.into() }).collect(),
+            config: SenseConfig::default(),
+        }).unwrap();
+        assert!(output.edges.iter().any(|e| e.source_id == 2 && e.target_id == 4));
+        assert_eq!(output.nodes.iter().find(|n| n.id == 2).unwrap().source_type, "lexical_seed");
     }
 }
