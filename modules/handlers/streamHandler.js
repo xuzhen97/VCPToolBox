@@ -2,7 +2,7 @@
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const roleDivider = require('../roleDivider.js');
-const { formatToolResultBatch, projectToolBatchForUpstream } = require('../toolResultBatch.js');
+const { formatToolResultBatch, projectToolBatchForUpstream, buildToolPayloadMessage } = require('../toolResultBatch.js');
 const { matchesNativeToolIsolation } = require('../nativeToolIsolation.js');
 const {
   extractReasoningText,
@@ -771,7 +771,7 @@ class StreamHandler {
       }
 
       const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(toolCalls);
-      const archeryErrorContents = [];
+      const archeryReceiptGroups = [];
       const archeryStatusSummaryItems = [];
       const visibleToolResults = [];
       const emitToolBatch = () => {
@@ -788,20 +788,20 @@ class StreamHandler {
       };
 
       // 执行 Archery 调用
-      const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
+      const archeryLogs = await Promise.all(archeryCalls.map(async (toolCall, index) => {
         try {
           const result = await toolExecutor.execute(toolCall, clientIp, currentMessagesForLoop);
           const isError = !result.success || (result.raw && this.context.isToolResultError(result.raw));
 
           if (isError) {
             archeryStatusSummaryItems.push(`${toolCall.name} 调用失败${result.recordId ? ` (记录ID: ${result.recordId})` : ''}`);
-            archeryErrorContents.push({
+            archeryReceiptGroups[index] = { name: toolCall.name, parts: [{
               type: 'text',
               text: `[异步工具 "${toolCall.name}" 返回了错误，请注意]:\n${result.content[0].text}`
-            });
+            }] };
           } else if (result.approvalFeedbackContent?.length) {
             // 用户明确输入的审核留言优先于 archery 静默；只回灌留言，不回灌成功业务输出。
-            archeryErrorContents.push(...result.approvalFeedbackContent);
+            archeryReceiptGroups[index] = { name: toolCall.name, parts: result.approvalFeedbackContent };
           }
 
           const forceThisOne = !shouldShowVCP && toolCall.markHistory;
@@ -815,11 +815,12 @@ class StreamHandler {
           return { tool: toolCall, result: [{ type: 'text', text: String(e.message) }] };
         }
       }));
+      const archeryGroups = archeryReceiptGroups.filter(Boolean);
+      const archeryErrorContents = archeryGroups.flatMap(group => group.parts);
 
       // 处理纯 Archery 的错误或用户审核留言；成功留言不改变工具成功状态。
       if (normalCalls.length === 0 && archeryErrorContents.length > 0) {
-        const errorPayload = `<!-- VCP_TOOL_PAYLOAD -->\n${JSON.stringify(archeryErrorContents)}`;
-        currentMessagesForLoop.push({ role: 'user', content: errorPayload });
+        currentMessagesForLoop.push(await buildToolPayloadMessage(archeryGroups));
 
         if (!res.writableEnded && !res.destroyed) {
           try {
@@ -914,8 +915,6 @@ class StreamHandler {
         clearInterval(loopKeepAliveTimer);
         throw toolExecErr;
       }
-      const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
-      if (archeryErrorContents.length > 0) combinedToolResultsForAI.push(...archeryErrorContents);
 
       const normalCallLogs = (() => {
         let logs = [];
@@ -964,30 +963,26 @@ class StreamHandler {
         try { emitToolBatch(); } catch (e) {}
       }
 
-      // RAG 刷新
-      const toolResultsTextForRAG = JSON.stringify(combinedToolResultsForAI, (k, v) =>
-        (k === 'url' || k === 'image_url') && typeof v === 'string' && v.startsWith('data:') ? "[Omitted]" : v
-      );
-
+      // RAG 保留原表示，与发给模型的内容块分开。
       if (RAGMemoRefresh) {
+        const toolResultsTextForRAG = JSON.stringify([
+          ...toolResults.flatMap(result => result.content), ...archeryErrorContents
+        ], (k, v) =>
+          (k === 'url' || k === 'image_url') && typeof v === 'string' && v.startsWith('data:') ? "[Omitted]" : v
+        );
         currentMessagesForLoop = await _refreshRagBlocksIfNeeded(currentMessagesForLoop, {
           lastAiMessage: currentAIContentForLoop,
           toolResultsText: toolResultsTextForRAG
         }, pluginManager, DEBUG_MODE);
       }
 
-      const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
-      const translatedToolResultsForAI = hasImage
-        ? await maybeTranslateToolPayloadMedia([
-          { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` },
-          ...combinedToolResultsForAI
-        ])
-        : null;
-      const finalToolPayloadForAI = hasImage
-        ? translatedToolResultsForAI
-        : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
-
-      currentMessagesForLoop.push({ role: 'user', content: finalToolPayloadForAI });
+      currentMessagesForLoop.push(await buildToolPayloadMessage([
+        ...toolResults.map((result, index) => ({
+          name: normalCalls[index]?.name,
+          parts: result.contentForAI ?? result.content
+        })),
+        ...archeryGroups
+      ], maybeTranslateToolPayloadMedia));
 
       if (!res.writableEnded && !res.destroyed) {
         try {
